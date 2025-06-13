@@ -3,11 +3,19 @@ import pandas as pd
 import psycopg2
 import logging
 from datetime import datetime
-import matplotlib.pyplot as plt
-import seaborn as sns
+import plotly.express as px
+import plotly.graph_objects as go
 import io
 import uuid
 import re
+from docx import Document
+from docx.shared import Inches
+import pdfkit
+from tempfile import NamedTemporaryFile
+import base64
+from docx.enum.style import WD_STYLE_TYPE
+from docx.shared import Pt
+from docx import Document
 
 # Настройка логирования
 logging.basicConfig(
@@ -15,17 +23,42 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
-
 def log_action(action, details=None, username=None):
     log_msg = f"{action} {'by ' + username if username else ''}"
     if details:
         log_msg += f" - Details: {details}"
-    logging.info(log_msg)
+    log_msg = f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - INFO - {log_msg}\n"
+    log_file = 'edit_access_denied.log' if action == "Access denied to edit data" else 'pharma_metadata.log'
+    try:
+        with open(log_file, 'a') as f:
+            f.write(log_msg)
+    except Exception as e:
+        print(f"Error writing to log {log_file}: {e}")
 
-def get_logs():
-    with open('pharma_metadata.log', 'r') as f:
-        return f.readlines()
-
+def get_logs(log_type='main'):
+    log_file = 'pharma_metadata.log' if log_type == 'main' else 'edit_access_denied.log'
+    try:
+        with open(log_file, 'r') as f:
+            return f.readlines()
+    except FileNotFoundError:
+        return [f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - INFO - Log file {log_file} created\n"]
+    
+def clear_logs_daily():
+    import os
+    import time
+    log_files = ['pharma_metadata.log', 'edit_access_denied.log']
+    twenty_four_hours = 24 * 60 * 60  # 24 hours in seconds
+    current_time = time.time()
+    for log_file in log_files:
+        try:
+            if os.path.exists(log_file):
+                mtime = os.path.getmtime(log_file)
+                if current_time - mtime > twenty_four_hours:
+                    with open(log_file, 'w') as f:
+                        f.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - INFO - Log cleared\n")
+        except Exception as e:
+            print(f"Error clearing log {log_file}: {e}")
+            
 # Настройка подключения к PostgreSQL
 def get_db_connection():
     try:
@@ -40,13 +73,11 @@ def get_db_connection():
     except psycopg2.Error as e:
         st.error(f"Ошибка подключения к базе данных: {e}")
         return None
-
 def init_db():
     conn = get_db_connection()
     if conn is None:
         return
     c = conn.cursor()
-
     # Создание таблицы companies
     c.execute('''CREATE TABLE IF NOT EXISTS companies (
         id SERIAL PRIMARY KEY,
@@ -58,7 +89,6 @@ def init_db():
         address VARCHAR(200),
         type VARCHAR(50)
     )''')
-
     # Создание таблицы medicines
     c.execute('''CREATE TABLE IF NOT EXISTS medicines (
         id SERIAL PRIMARY KEY,
@@ -70,10 +100,12 @@ def init_db():
         shared BOOLEAN DEFAULT FALSE,
         batch_number VARCHAR(50),
         expiration_date DATE,
+        dosage_form VARCHAR(50),
+        active_ingredient VARCHAR(100),
+        package_size VARCHAR(50),
         created_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY (owned_by) REFERENCES companies(id) ON DELETE SET NULL
     )''')
-
     # Создание таблицы locations
     c.execute('''CREATE TABLE IF NOT EXISTS locations (
         id SERIAL PRIMARY KEY,
@@ -87,7 +119,6 @@ def init_db():
         created_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY (owned_by) REFERENCES companies(id) ON DELETE SET NULL
     )''')
-
     # Создание таблицы operations
     c.execute('''CREATE TABLE IF NOT EXISTS operations (
         id SERIAL PRIMARY KEY,
@@ -100,7 +131,6 @@ def init_db():
         FOREIGN KEY (medicine_id) REFERENCES medicines(id) ON DELETE SET NULL,
         FOREIGN KEY (location_id) REFERENCES locations(id) ON DELETE SET NULL
     )''')
-
     # Создание таблицы users
     c.execute('''CREATE TABLE IF NOT EXISTS users (
         id SERIAL PRIMARY KEY,
@@ -111,7 +141,6 @@ def init_db():
         last_name VARCHAR(50),
         email VARCHAR(100)
     )''')
-
     # Добавление столбца medicine_id, если он отсутствует
     c.execute("SELECT column_name FROM information_schema.columns WHERE table_name = 'operations' AND column_name = 'medicine_id'")
     if not c.fetchone():
@@ -132,6 +161,11 @@ def init_db():
     sku_constraint = c.fetchone()
     if sku_constraint:
         c.execute(f"ALTER TABLE medicines DROP CONSTRAINT {sku_constraint[0]}")
+        
+    # Добавляем столбец atc_code, если его нет
+    c.execute("SELECT column_name FROM information_schema.columns WHERE table_name = 'medicines' AND column_name = 'atc_code'")
+    if not c.fetchone():
+        c.execute("ALTER TABLE medicines ADD COLUMN atc_code VARCHAR(20)")
 
     conn.commit()
     conn.close()
@@ -170,21 +204,21 @@ def get_operations():
     return df
 
 # Функции добавления
-def add_medication(name, gtin, sku, market, batch_number, expiration_date, owned_by, username):
+def add_medication(name, gtin, sku, market, batch_number, expiration_date, dosage_form, active_ingredient, package_size, owned_by, atc_code, username):
     conn = get_db_connection()
     if conn is None:
         return
     c = conn.cursor()
     try:
         c.execute('''INSERT INTO medicines 
-                     (name, gtin, sku, market, shared, batch_number, expiration_date, owned_by, created_date) 
-                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)''',
-                  (name, gtin, sku, market, False, batch_number, expiration_date, owned_by,
+                     (name, gtin, sku, market, shared, batch_number, expiration_date, dosage_form, active_ingredient, package_size, owned_by, atc_code, created_date) 
+                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)''',
+                  (name, gtin, sku, market, False, batch_number, expiration_date, dosage_form, active_ingredient, package_size, owned_by, atc_code,
                    datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
         conn.commit()
         log_action("Added medication", f"ID: {c.lastrowid}", username)
     except psycopg2.Error as e:
-        st.error(f"Ошибка добавления медикамента: {e}")
+        st.error(f"Ошибка добавления Препарата: {e}")
     finally:
         conn.close()
 
@@ -242,20 +276,21 @@ def add_operation(medicine_id, location_id, operation_type, operation_date, quan
         conn.close()
 
 # Функции редактирования
-def edit_medication(med_id, name, gtin, sku, market, batch_number, expiration_date, owned_by, username):
+def edit_medication(med_id, name, gtin, sku, market, batch_number, expiration_date, dosage_form, active_ingredient, package_size, owned_by, atc_code, username):
     conn = get_db_connection()
     if conn is None:
         return
     c = conn.cursor()
     try:
         c.execute('''UPDATE medicines 
-                     SET name=%s, gtin=%s, sku=%s, market=%s, batch_number=%s, expiration_date=%s, owned_by=%s 
+                     SET name=%s, gtin=%s, sku=%s, market=%s, batch_number=%s, expiration_date=%s, 
+                         dosage_form=%s, active_ingredient=%s, package_size=%s, owned_by=%s, atc_code=%s 
                      WHERE id=%s''',
-                  (name, gtin, sku, market, batch_number, expiration_date, owned_by, med_id))
+                  (name, gtin, sku, market, batch_number, expiration_date, dosage_form, active_ingredient, package_size, owned_by, atc_code, med_id))
         conn.commit()
-        log_action("Edited medication", f"ID: {med_id}, Changed fields: {', '.join([f'{k}={v}' for k, v in {'name': name, 'gtin': gtin, 'sku': sku, 'market': market, 'batch_number': batch_number, 'expiration_date': str(expiration_date), 'owned_by': owned_by}.items() if v])}", username)
+        log_action("Edited medication", f"ID: {med_id}, Changed fields: {', '.join([f'{k}={v}' for k, v in {'name': name, 'gtin': gtin, 'sku': sku, 'market': market, 'batch_number': batch_number, 'expiration_date': str(expiration_date), 'dosage_form': dosage_form, 'active_ingredient': active_ingredient, 'package_size': package_size, 'owned_by': owned_by, 'atc_code': atc_code}.items() if v])}", username)
     except psycopg2.Error as e:
-        st.error(f"Ошибка редактирования медикамента: {e}")
+        st.error(f"Ошибка редактирования Препарата: {e}")
     finally:
         conn.close()
 
@@ -319,13 +354,13 @@ def delete_medication(med_id):
     try:
         c.execute("SELECT COUNT(*) FROM operations WHERE medicine_id = %s", (med_id,))
         if c.fetchone()[0] > 0:
-            st.error("Нельзя удалить медикамент, так как он связан с операциями")
+            st.error("Нельзя удалить Препарат, так как он связан с операциями")
             return
         c.execute("DELETE FROM medicines WHERE id=%s", (med_id,))
         conn.commit()
         log_action("Deleted medication", f"ID: {med_id}")
     except psycopg2.Error as e:
-        st.error(f"Ошибка удаления медикамента: {e}")
+        st.error(f"Ошибка удаления Препарата: {e}")
     finally:
         conn.close()
 
@@ -396,16 +431,17 @@ def import_data(file):
                 for _, row in df.iterrows():
                     c.execute('''SELECT id FROM medicines 
                                  WHERE name = %s AND gtin = %s AND sku = %s AND market = %s 
-                                 AND batch_number = %s AND expiration_date = %s AND owned_by = %s''',
+                                 AND batch_number = %s AND expiration_date = %s AND dosage_form = %s 
+                                 AND active_ingredient = %s AND package_size = %s AND owned_by = %s''AND atc_code = %s''',
                               (row['name'], row['gtin'], row['sku'], row['market'], row['batch_number'],
-                               row['expiration_date'], row['owned_by']))
+                               row['expiration_date'], row['dosage_form'], row['active_ingredient'], row['package_size'], row['owned_by'], row.get('atc_code', None)))
                     if c.fetchone():
                         continue
                     c.execute('''INSERT INTO medicines 
-                                 (name, gtin, sku, market, shared, batch_number, expiration_date, owned_by, created_date) 
-                                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)''',
+                                 (name, gtin, sku, market, shared, batch_number, expiration_date, dosage_form, active_ingredient, package_size, owned_by, created_date) 
+                                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)''',
                               (row['name'], row['gtin'], row['sku'], row['market'], row['shared'], row['batch_number'],
-                               row['expiration_date'], row['owned_by'], datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+                               row['expiration_date'], row['dosage_form'], row['active_ingredient'], row['package_size'], row['owned_by'], datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
             elif table == 'companies':
                 for _, row in df.iterrows():
                     c.execute('''SELECT id FROM companies 
@@ -460,7 +496,7 @@ def export_data(table):
                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 # Валидация данных
-def validate_medication_data(name, gtin, sku, market, batch_number, expiration_date, owned_by):
+def validate_medication_data(name, gtin, sku, market, batch_number, expiration_date, dosage_form, active_ingredient, package_size, owned_by, atc_code):
     errors = []
     if not name:
         errors.append("Название не может быть пустым")
@@ -474,8 +510,16 @@ def validate_medication_data(name, gtin, sku, market, batch_number, expiration_d
         errors.append("Номер партии не может быть пустым")
     if not expiration_date:
         errors.append("Срок годности обязателен")
+    if not dosage_form:
+        errors.append("Форма выпуска обязательна")
+    if not active_ingredient:
+        errors.append("Активный ингредиент обязателен")
+    if not package_size:
+        errors.append("Объем/Размер упаковки обязателен")
     if not owned_by:
         errors.append("Компания-владелец обязательна")
+    if atc_code and not re.match(r'^[A-Z]{1,2}[0-9]{2}[A-Z]{0,2}[0-9]{0,2}$', atc_code):
+        errors.append("Код АТС имеет неверный формат (пример: A10BA02)")
     return errors
 
 def validate_company_data(gln, name_short, name_full, gcp_compliant, registration_country, address, type):
@@ -521,7 +565,7 @@ def validate_location_data(gln, country, address, role, name_short, name_full, o
 def validate_operation_data(medicine_id, location_id, operation_type, operation_date, quantity):
     errors = []
     if not medicine_id:
-        errors.append("ID медикамента обязателен")
+        errors.append("ID Препарата обязателен")
     if not location_id:
         errors.append("ID локации обязателен")
     if not operation_type:
@@ -586,7 +630,7 @@ def auth_interface():
     """, unsafe_allow_html=True)
 
     st.markdown('<div class="login-container">', unsafe_allow_html=True)
-    st.markdown('<h2>Авторизация</h2>', unsafe_allow_html=True)
+    st.markdown('<h2>Авторизация в Kvinta</h2>', unsafe_allow_html=True)
     
     username = st.text_input("Логин", key="login_username", placeholder="Введите логин")
     password = st.text_input("Пароль", type="password", key="login_password", placeholder="Введите пароль")
@@ -594,35 +638,140 @@ def auth_interface():
     if st.button("Войти"):
         if login(username, password):
             st.success("Успешный вход!")
+            st.session_state['show_kvinta_page'] = True
+            st.session_state['show_main_page'] = False
             st.rerun()
         else:
-            st.markdown('<p class="error-message">Неверный логин или пароль</p>', unsafe_allow_html=True)
-    
+            st.session_state['show_access_denied'] = True
+            st.rerun()
+
+# Страница отказа в доступе
+def show_access_denied():
+    st.markdown(""" 
+    <style>
+        .access-denied-container {
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            background-color: rgba(211, 47, 47, 0.5); /* Более прозрачный фон */
+            padding: 20px;
+            border-radius: 10px;
+            text-align: center;
+            color: white;
+            font-size: 24px;
+            max-width: 400px; /* Ограничение ширины */
+            margin: 50px auto; /* Центрирование с отступом сверху */
+        }
+        .access-denied-text {
+            font-size: 16px;
+            margin-top: 10px;
+        }
+        .return-button {
+            display: flex;
+            justify-content: flex-start;
+            margin-top: 20px;
+            padding-left: 20px;
+        }
+        .return-button > button {
+            background-color: #4CAF50;
+            color: white;
+            padding: 10px 20px;
+            font-size: 16px;
+            border-radius: 5px;
+            border: none;
+            cursor: pointer;
+        }
+        .return-button > button:hover {
+            background-color: #45a049;
+        }
+    </style>
+    """, unsafe_allow_html=True)
+    st.markdown("""
+    <div class="access-denied-container">
+        Нет прав пользования подсистемой
+        <div class="access-denied-text">Обратитесь к администратору для получения доступа.</div>
+    </div>
+    """, unsafe_allow_html=True)
+    st.markdown('<div class="return-button">', unsafe_allow_html=True)
+    if st.button("Вернуться к авторизации"):
+        st.session_state['show_access_denied'] = False
+        st.rerun()
     st.markdown('</div>', unsafe_allow_html=True)
 
 # Интерфейс и страницы
 def show_view_data():
     st.subheader("Просмотр данных")
     entity = st.selectbox("Выберите тип данных", ["Препараты", "Компании", "Локации", "Операции"])
+    
     if entity == "Препараты":
         df = get_medications()
+        companies = get_companies()
+        if not df.empty:
+            if not companies.empty:
+                # Merge с явным указанием суффиксов для избежания конфликтов
+                df = df.merge(companies[['id', 'name_full']], left_on='owned_by', right_on='id', how='left', suffixes=('', '_company'))
+                df = df.rename(columns={'name_full': 'owned_by_name'})
+                # Удаляем только owned_by и id_company (если есть)
+                display_df = df.drop(columns=['owned_by', 'id_company'], errors='ignore')
+            else:
+                # Если companies пустой, создаём owned_by_name с None
+                df['owned_by_name'] = None
+                display_df = df.drop(columns=['owned_by'], errors='ignore')
+            # Проверяем наличие столбцов перед выбором
+            available_columns = [col for col in ['id', 'owned_by_name', 'name', 'gtin', 'sku', 'atc_code', 'market', 'shared', 'batch_number', 'expiration_date', 'dosage_form', 'active_ingredient', 'package_size', 'created_date'] if col in display_df.columns]
+            display_df = display_df[available_columns]
+        else:
+            display_df = df
     elif entity == "Компании":
-        df = get_companies()
+        display_df = get_companies()
     elif entity == "Локации":
         df = get_locations()
-    else:
+        companies = get_companies()
+        if not df.empty:
+            if not companies.empty:
+                df = df.merge(companies[['id', 'name_full']], left_on='owned_by', right_on='id', how='left', suffixes=('', '_company'))
+                df = df.rename(columns={'name_full': 'owned_by_name'})
+                display_df = df.drop(columns=['owned_by', 'id_company'], errors='ignore')
+            else:
+                df['owned_by_name'] = None
+                display_df = df.drop(columns=['owned_by'], errors='ignore')
+            available_columns = [col for col in ['id', 'owned_by_name', 'gln', 'country', 'address', 'role', 'name_short', 'name_full', 'created_date'] if col in display_df.columns]
+            display_df = display_df[available_columns]
+        else:
+            display_df = df
+    else:  # Операции
         df = get_operations()
-    if not df.empty:
+        medicines = get_medications()
+        locations = get_locations()
+        if not df.empty:
+            if not medicines.empty:
+                df = df.merge(medicines[['id', 'name']], left_on='medicine_id', right_on='id', how='left', suffixes=('', '_med'))
+                df = df.rename(columns={'name': 'medicine_name'})
+            else:
+                df['medicine_name'] = None
+            if not locations.empty:
+                df = df.merge(locations[['id', 'name_short']], left_on='location_id', right_on='id', how='left', suffixes=('', '_loc'))
+                df = df.rename(columns={'name_short': 'location_name'})
+            else:
+                df['location_name'] = None
+            display_df = df.drop(columns=['medicine_id', 'location_id', 'id_med', 'id_loc'], errors='ignore')
+            available_columns = [col for col in ['id', 'medicine_name', 'location_name', 'operation_type', 'operation_date', 'quantity', 'created_date'] if col in display_df.columns]
+            display_df = display_df[available_columns]
+        else:
+            display_df = df
+
+    if not display_df.empty:
         st.write("### Данные")
-        st.dataframe(df)
+        st.dataframe(display_df)
         st.write("### Числовая статистика")
-        numeric_df = df.select_dtypes(include=['int64', 'float64'])
+        numeric_df = display_df.select_dtypes(include=['int64', 'float64'])
         if not numeric_df.empty:
             st.dataframe(numeric_df.describe())
         else:
             st.info("Нет числовых данных для статистики.")
         st.write("### Категориальная статистика")
-        categorical_df = df.select_dtypes(include=['object', 'bool'])
+        categorical_df = display_df.select_dtypes(include=['object', 'bool'])
         if not categorical_df.empty:
             st.dataframe(categorical_df.describe())
         else:
@@ -634,6 +783,7 @@ def show_view_data():
 
 def show_edit_delete_data():
     if st.session_state['role'] not in ['admin', 'analyst']:
+        log_action("Access denied to edit data", username=st.session_state['username'])
         st.error("Доступ запрещен")
         return
     st.subheader("Редактировать или удалить запись")
@@ -642,10 +792,10 @@ def show_edit_delete_data():
 
     if action == "Удалить":
         if entity == "Препараты":
-            med_id = st.number_input("ID медикамента для удаления", min_value=1)
+            med_id = st.number_input("ID Препарата для удаления", min_value=1)
             if st.button("Удалить"):
                 delete_medication(med_id)
-                st.success("Медикамент удален!")
+                st.success("Препарат удален!")
         elif entity == "Компании":
             company_id = st.number_input("ID компании для удаления", min_value=1)
             if st.button("Удалить"):
@@ -667,113 +817,126 @@ def show_edit_delete_data():
         if conn is None:
             return
         c = conn.cursor()
-        if entity == "Препараты":
-            c.execute("SELECT * FROM medicines WHERE id = %s", (record_id,))
-            record = c.fetchone()
-            if record:
-                df = pd.DataFrame([record], columns=['id', 'owned_by', 'name', 'gtin', 'sku', 'market', 'shared', 'batch_number', 'expiration_date', 'created_date'])
-                companies = get_companies()
-                company_options = {f"{row['name_full']} (ID: {row['id']})": row['id'] for _, row in companies.iterrows()} if not companies.empty else {"Нет компаний": None}
-                with st.form(key=f"edit_med_{record_id}_{uuid.uuid4()}"):
-                    name = st.text_input("Название", value=df['name'].iloc[0], help="Название медикамента (до 50 символов)")
-                    gtin = st.text_input("GTIN", value=df['gtin'].iloc[0], help="Глобальный номер товара (до 20 символов)")
-                    sku = st.text_input("SKU", value=df['sku'].iloc[0], help="Внутренний артикул (до 20 символов)")
-                    market = st.text_input("Рынок", value=df['market'].iloc[0], help="Целевой рынок (до 20 символов)")
-                    batch_number = st.text_input("Номер партии", value=df['batch_number'].iloc[0], help="Уникальный номер партии (до 50 символов)")
-                    expiration_date = st.date_input("Срок годности", value=pd.to_datetime(df['expiration_date'].iloc[0]), help="Дата окончания срока годности")
-                    owned_by_choice = st.selectbox("Компания-владелец", list(company_options.keys()), index=list(company_options.keys()).index(next((k for k, v in company_options.items() if v == df['owned_by'].iloc[0]), 0)), help="Выберите компанию-владельца")
-                    if st.form_submit_button("Сохранить"):
-                        errors = validate_medication_data(name, gtin, sku, market, batch_number, expiration_date, company_options[owned_by_choice])
-                        if errors:
-                            for error in errors:
-                                st.error(error)
-                        else:
-                            c.execute('''SELECT id FROM medicines 
-                                         WHERE name = %s AND gtin = %s AND sku = %s AND market = %s 
-                                         AND batch_number = %s AND expiration_date = %s AND owned_by = %s 
-                                         AND id != %s''',
-                                      (name, gtin, sku, market, batch_number, expiration_date, company_options[owned_by_choice], record_id))
-                            if c.fetchone():
-                                st.error("Такая запись уже существует")
+        try:
+            if entity == "Препараты":
+                c.execute("SELECT * FROM medicines WHERE id = %s", (record_id,))
+                record = c.fetchone()
+                if record:
+                    df = pd.DataFrame([record], columns=['id', 'owned_by', 'name', 'gtin', 'sku', 'market', 'shared', 'batch_number', 'expiration_date', 'dosage_form', 'active_ingredient', 'package_size', 'atc_code', 'created_date'])
+                    companies = get_companies()
+                    company_options = {f"{row['name_full']} (ID: {row['id']})": row['id'] for _, row in companies.iterrows()} if not companies.empty else {"Нет компаний": None}
+                    with st.form(key=f"edit_med_{record_id}"):
+                        name = st.text_input("Название", value=df['name'].iloc[0] or "")
+                        gtin = st.text_input("GTIN", value=df['gtin'].iloc[0] or "")
+                        sku = st.text_input("SKU", value=df['sku'].iloc[0] or "")
+                        market = st.text_input("Рынок", value=df['market'].iloc[0] or "")
+                        batch_number = st.text_input("Номер партии", value=df['batch_number'].iloc[0] or "")
+                        expiration_date = st.date_input("Срок годности", value=pd.to_datetime(df['expiration_date'].iloc[0]) if pd.notnull(df['expiration_date'].iloc[0]) else None)
+                        dosage_form = st.text_input("Форма выпуска", value=df['dosage_form'].iloc[0] or "")
+                        active_ingredient = st.text_input("Активный ингредиент", value=df['active_ingredient'].iloc[0] or "")
+                        package_size = st.text_input("Объем/Размер упаковки", value=df['package_size'].iloc[0] or "")
+                        atc_code = st.text_input("Код АТС", value=df['atc_code'].iloc[0] or "" if pd.notnull(df['atc_code'].iloc[0]) else "")
+                        owned_by_choice = st.selectbox("Компания-владелец", list(company_options.keys()), index=list(company_options.keys()).index(next((k for k, v in company_options.items() if v == df['owned_by'].iloc[0]), list(company_options.keys())[0])))
+                        if st.form_submit_button("Сохранить"):
+                            errors = validate_medication_data(name, gtin, sku, market, batch_number, expiration_date, dosage_form, active_ingredient, package_size, company_options[owned_by_choice], atc_code)
+                            if errors:
+                                for error in errors:
+                                    st.error(error)
                             else:
-                                edit_medication(record_id, name, gtin, sku, market, batch_number, expiration_date, company_options[owned_by_choice], st.session_state['username'])
-                                st.success("Медикамент обновлен!")
-        elif entity == "Компании":
-            c.execute("SELECT * FROM companies WHERE id = %s", (record_id,))
-            record = c.fetchone()
-            if record:
-                df = pd.DataFrame([record], columns=['id', 'gln', 'name_short', 'name_full', 'gcp_compliant', 'registration_country', 'address', 'type'])
-                with st.form(key=f"edit_comp_{record_id}_{uuid.uuid4()}"):
-                    gln = st.text_input("GLN", value=df['gln'].iloc[0], help="Глобальный номер местоположения (до 20 символов)")
-                    name_short = st.text_input("Краткое название", value=df['name_short'].iloc[0], help="Краткое название компании (до 50 символов)")
-                    name_full = st.text_input("Полное название", value=df['name_full'].iloc[0], help="Полное название компании (до 100 символов)")
-                    gcp_compliant = st.checkbox("GCP-совместимость", value=df['gcp_compliant'].iloc[0], help="Соответствие стандартам GCP")
-                    registration_country = st.text_input("Страна регистрации", value=df['registration_country'].iloc[0], help="Страна регистрации (до 50 символов)")
-                    address = st.text_input("Адрес", value=df['address'].iloc[0], help="Адрес компании (до 200 символов)")
-                    type = st.text_input("Тип", value=df['type'].iloc[0], help="Тип компании (например, Производитель, до 50 символов)")
-                    if st.formNft_button("Сохранить"):
-                        errors = validate_company_data(gln, name_short, name_full, gcp_compliant, registration_country, address, type)
-                        if errors:
-                            for error in errors:
-                                st.error(error)
-                        else:
-                            c.execute('''SELECT id FROM companies 
-                                         WHERE gln = %s AND name_short = %s AND name_full = %s 
-                                         AND gcp_compliant = %s AND registration_country = %s 
-                                         AND address = %s AND type = %s AND id != %s''',
-                                      (gln, name_short, name_full, gcp_compliant, registration_country, address, type, record_id))
-                            if c.fetchone():
-                                st.error("Такая запись уже существует")
+                                c.execute("SELECT id FROM medicines WHERE gtin = %s AND sku = %s AND id != %s", (gtin, sku, record_id))
+                                if c.fetchone():
+                                    st.error("Препарат с таким GTIN и SKU уже существует")
+                                else:
+                                    edit_medication(record_id, name, gtin, sku, market, batch_number, expiration_date, dosage_form, active_ingredient, package_size, company_options[owned_by_choice], atc_code or None, st.session_state['username'])
+                                    st.success("Препарат обновлен!")
+                                    log_action("Edited medication", f"ID: {record_id}", st.session_state['username'])
+                else:
+                    st.error("Препарат с таким ID не найден")
+            elif entity == "Компании":
+                c.execute("SELECT * FROM companies WHERE id = %s", (record_id,))
+                record = c.fetchone()
+                if record:
+                    df = pd.DataFrame([record], columns=['id', 'gln', 'name_short', 'name_full', 'gcp_compliant', 'registration_country', 'address', 'type'])
+                    with st.form(key=f"edit_comp_{record_id}"):
+                        gln = st.text_input("GLN", value=df['gln'].iloc[0] or "")
+                        name_short = st.text_input("Краткое название", value=df['name_short'].iloc[0] or "")
+                        name_full = st.text_input("Полное название", value=df['name_full'].iloc[0] or "")
+                        gcp_compliant = st.checkbox("GCP-совместимость", value=df['gcp_compliant'].iloc[0] if pd.notnull(df['gcp_compliant'].iloc[0]) else False)
+                        registration_country = st.text_input("Страна регистрации", value=df['registration_country'].iloc[0] or "")
+                        address = st.text_input("Адрес", value=df['address'].iloc[0] or "")
+                        type = st.text_input("Тип", value=df['type'].iloc[0] or "")
+                        if st.form_submit_button("Сохранить"):
+                            errors = validate_company_data(gln, name_short, name_full, gcp_compliant, registration_country, address, type)
+                            if errors:
+                                for error in errors:
+                                    st.error(error)
                             else:
-                                edit_company(record_id, gln, name_short, name_full, gcp_compliant, registration_country, address, type, st.session_state['username'])
-                                st.success("Компания обновлена!")
-        elif entity == "Локации":
-            c.execute("SELECT * FROM locations WHERE id = %s", (record_id,))
-            record = c.fetchone()
-            if record:
-                df = pd.DataFrame([record], columns=['id', 'owned_by', 'gln', 'country', 'address', 'role', 'name_short', 'name_full', 'created_date'])
-                companies = get_companies()
-                company_options = {f"{row['name_full']} (ID: {row['id']})": row['id'] for _, row in companies.iterrows()} if not companies.empty else {"Нет компаний": None}
-                with st.form(key=f"edit_loc_{record_id}_{uuid.uuid4()}"):
-                    gln = st.text_input("GLN", value=df['gln'].iloc[0], help="Глобальный номер местоположения (до 20 символов)")
-                    country = st.text_input("Страна", value=df['country'].iloc[0], help="Страна локации (до 50 символов)")
-                    address = st.text_input("Адрес", value=df['address'].iloc[0], help="Адрес локации (до 200 символов)")
-                    role = st.text_input("Роль", value=df['role'].iloc[0], help="Роль локации (например, Склад, до 50 символов)")
-                    name_short = st.text_input("Краткое название", value=df['name_short'].iloc[0], help="Краткое название локации (до 50 символов)")
-                    name_full = st.text_input("Полное название", value=df['name_full'].iloc[0], help="Полное название локации (до 100 символов)")
-                    owned_by_choice = st.selectbox("Компания-владелец", list(company_options.keys()), index=list(company_options.keys()).index(next((k for k, v in company_options.items() if v == df['owned_by'].iloc[0]), 0)), help="Выберите компанию-владельца")
-                    if st.form_submit_button("Сохранить"):
-                        errors = validate_location_data(gln, country, address, role, name_short, name_full, company_options[owned_by_choice])
-                        if errors:
-                            for error in errors:
-                                st.error(error)
-                        else:
-                            edit_location(record_id, gln, country, address, role, name_short, name_full, company_options[owned_by_choice], st.session_state['username'])
-                            st.success("Локация обновлена!")
-        elif entity == "Операции":
-            c.execute("SELECT * FROM operations WHERE id = %s", (record_id,))
-            record = c.fetchone()
-            if record:
-                df = pd.DataFrame([record], columns=['id', 'medicine_id', 'location_id', 'operation_type', 'operation_date', 'quantity', 'created_date'])
-                medicines = get_medications()
-                locations = get_locations()
-                medicine_options = {f"{row['name']} (ID: {row['id']})": row['id'] for _, row in medicines.iterrows()} if not medicines.empty else {"Нет медикаментов": None}
-                location_options = {f"{row['name_short'] or row['name_full'] or f'Локация ID {row['id']}'} (ID: {row['id']})": row['id'] for _, row in locations.iterrows()} if not locations.empty else {"Нет локаций": None}
-                with st.form(key=f"edit_op_{record_id}_{uuid.uuid4()}"):
-                    medicine_choice = st.selectbox("Медикамент", list(medicine_options.keys()), index=list(medicine_options.keys()).index(next((k for k, v in medicine_options.items() if v == df['medicine_id'].iloc[0]), 0)), help="Выберите медикамент")
-                    location_choice = st.selectbox("Локация", list(location_options.keys()), index=list(location_options.keys()).index(next((k for k, v in location_options.items() if v == df['location_id'].iloc[0]), 0)), help="Выберите локацию")
-                    operation_type = st.selectbox("Тип операции", ["Агрегация", "Дистрибьютор", "Поставка", "Списание", "Производство", "Перемещение"], index=["Агрегация", "Дистрибьютор", "Поставка", "Списание", "Производство", "Перемещение"].index(df['operation_type'].iloc[0]), help="Выберите тип операции")
-                    operation_date = st.date_input("Дата операции", value=pd.to_datetime(df['operation_date'].iloc[0]), help="Дата выполнения операции")
-                    quantity = st.number_input("Количество", min_value=1, value=df['quantity'].iloc[0], help="Количество единиц")
-                    if st.form_submit_button("Сохранить"):
-                        errors = validate_operation_data(medicine_options[medicine_choice], location_options[location_choice], operation_type, operation_date, quantity)
-                        if errors:
-                            for error in errors:
-                                st.error(error)
-                        else:
-                            edit_operation(record_id, medicine_options[medicine_choice], location_options[location_choice], operation_type, operation_date, quantity, st.session_state['username'])
-                            st.success("Операция обновлена!")
-        conn.close()
+                                c.execute("SELECT id FROM companies WHERE gln = %s AND name_full = %s AND id != %s", (gln, name_full, record_id))
+                                if c.fetchone():
+                                    st.error("Компания с таким GLN и полным названием уже существует")
+                                else:
+                                    edit_company(record_id, gln or None, name_short, name_full, gcp_compliant, registration_country or None, address or None, type or None, st.session_state['username'])
+                                    st.success("Компания обновлена!")
+                                    log_action("Edited company", f"ID: {record_id}", st.session_state['username'])
+                else:
+                    st.error("Компания с таким ID не найдена")
+            elif entity == "Локации":
+                c.execute("SELECT * FROM locations WHERE id = %s", (record_id,))
+                record = c.fetchone()
+                if record:
+                    df = pd.DataFrame([record], columns=['id', 'owned_by', 'gln', 'country', 'address', 'role', 'name_short', 'name_full', 'created_date'])
+                    companies = get_companies()
+                    company_options = {f"{row['name_full']} (ID: {row['id']})": row['id'] for _, row in companies.iterrows()} if not companies.empty else {"Нет компаний": None}
+                    with st.form(key=f"edit_loc_{record_id}"):
+                        gln = st.text_input("GLN", value=df['gln'].iloc[0] or "")
+                        country = st.text_input("Страна", value=df['country'].iloc[0] or "")
+                        address = st.text_input("Адрес", value=df['address'].iloc[0] or "")
+                        role = st.text_input("Роль", value=df['role'].iloc[0] or "")
+                        name_short = st.text_input("Краткое название", value=df['name_short'].iloc[0] or "")
+                        name_full = st.text_input("Полное название", value=df['name_full'].iloc[0] or "")
+                        owned_by_choice = st.selectbox("Компания-владелец", list(company_options.keys()), index=list(company_options.keys()).index(next((k for k, v in company_options.items() if v == df['owned_by'].iloc[0]), list(company_options.keys())[0])))
+                        if st.form_submit_button("Сохранить"):
+                            errors = validate_location_data(gln, country, address, role, name_short, name_full, company_options[owned_by_choice])
+                            if errors:
+                                for error in errors:
+                                    st.error(error)
+                            else:
+                                edit_location(record_id, gln or None, country or None, address, role or None, name_short or None, name_full or None, company_options[owned_by_choice], st.session_state['username'])
+                                st.success("Локация обновлена!")
+                                log_action("Edited location", f"ID: {record_id}", st.session_state['username'])
+                else:
+                    st.error("Локация с таким ID не найдена")
+            elif entity == "Операции":
+                c.execute("SELECT * FROM operations WHERE id = %s", (record_id,))
+                record = c.fetchone()
+                if record:
+                    df = pd.DataFrame([record], columns=['id', 'medicine_id', 'location_id', 'operation_type', 'operation_date', 'quantity', 'created_date'])
+                    medicines = get_medications()
+                    locations = get_locations()
+                    medicine_options = {f"{row['name']} (ID: {row['id']})": row['id'] for _, row in medicines.iterrows()} if not medicines.empty else {"Нет препаратов": None}
+                    location_options = {f"{row['name_short'] or row['name_full'] or f'Локация ID {row['id']}'} (ID: {row['id']})": row['id'] for _, row in locations.iterrows()} if not locations.empty else {"Нет локаций": None}
+                    with st.form(key=f"edit_op_{record_id}"):
+                        medicine_choice = st.selectbox("Препарат", list(medicine_options.keys()), index=list(medicine_options.keys()).index(next((k for k, v in medicine_options.items() if v == df['medicine_id'].iloc[0]), list(medicine_options.keys())[0])))
+                        location_choice = st.selectbox("Локация", list(location_options.keys()), index=list(location_options.keys()).index(next((k for k, v in location_options.items() if v == df['location_id'].iloc[0]), list(location_options.keys())[0])))
+                        operation_type = st.selectbox("Тип операции", ["Агрегация", "Дистрибьютор", "Поставка", "Списание", "Производство", "Перемещение"], index=["Агрегация", "Дистрибьютор", "Поставка", "Списание", "Производство", "Перемещение"].index(df['operation_type'].iloc[0]) if df['operation_type'].iloc[0] in ["Агрегация", "Дистрибьютор", "Поставка", "Списание", "Производство", "Перемещение"] else 0)
+                        operation_date = st.date_input("Дата операции", value=pd.to_datetime(df['operation_date'].iloc[0]) if pd.notnull(df['operation_date'].iloc[0]) else None)
+                        quantity = st.number_input("Количество", min_value=1, value=int(df['quantity'].iloc[0]) if pd.notnull(df['quantity'].iloc[0]) else 1)
+                        if st.form_submit_button("Сохранить"):
+                            errors = validate_operation_data(medicine_options[medicine_choice], location_options[location_choice], operation_type, operation_date, quantity)
+                            if errors:
+                                for error in errors:
+                                    st.error(error)
+                            else:
+                                edit_operation(record_id, medicine_options[medicine_choice], location_options[location_choice], operation_type, operation_date, quantity, st.session_state['username'])
+                                st.success("Операция обновлена!")
+                                log_action("Edited operation", f"ID: {record_id}", st.session_state['username'])
+                else:
+                    st.error("Операция с таким ID не найдена")
+        except Exception as e:
+            st.error(f"Ошибка редактирования: {e}")
+            log_action("Edit error", f"Entity: {entity}, ID: {record_id}, Error: {str(e)}", st.session_state['username'])
+        finally:
+            conn.close()
 
 def show_add_data():
     st.subheader("Добавить новую запись")
@@ -782,19 +945,23 @@ def show_add_data():
         companies = get_companies()
         company_options = {f"{row['name_full']} (ID: {row['id']})": row['id'] for _, row in companies.iterrows()} if not companies.empty else {"Нет компаний": None}
         with st.form(key="add_med"):
-            name = st.text_input("Название", help="Название медикамента (до 50 символов)")
-            gtin = st.text_input("GTIN", help="Глобальный номер товара (до 20 символов)")
-            sku = st.text_input("SKU", help="Внутренний артикул (до 20 символов)")
-            market = st.text_input("Рынок", help="Целевой рынок (до 20 символов)")
-            batch_number = st.text_input("Номер партии", help="Уникальный номер партии (до 50 символов)")
-            expiration_date = st.date_input("Срок годности", help="Дата окончания срока годности")
-            owned_by_choice = st.selectbox("Компания-владелец", list(company_options.keys()), help="Выберите компанию-владельца")
+            name = st.text_input("Название")
+            gtin = st.text_input("GTIN")
+            sku = st.text_input("SKU")
+            market = st.text_input("Рынок")
+            batch_number = st.text_input("Номер партии")
+            expiration_date = st.date_input("Срок годности")
+            dosage_form = st.text_input("Форма выпуска")
+            active_ingredient = st.text_input("Активный ингредиент")
+            package_size = st.text_input("Объем/Размер упаковки")
+            atc_code = st.text_input("Код АТС (например, A10BA02)")
+            owned_by_choice = st.selectbox("Компания-владелец", list(company_options.keys()))
             uploaded_file = st.file_uploader("Импорт из CSV/Excel", type=['csv', 'xlsx'], key="med_import")
             if uploaded_file:
                 import_data(uploaded_file)
             if st.form_submit_button("Добавить"):
                 owned_by = company_options.get(owned_by_choice)
-                errors = validate_medication_data(name, gtin, sku, market, batch_number, expiration_date, owned_by)
+                errors = validate_medication_data(name, gtin, sku, market, batch_number, expiration_date, dosage_form, active_ingredient, package_size, owned_by, atc_code)
                 if errors:
                     for error in errors:
                         st.error(error)
@@ -803,25 +970,26 @@ def show_add_data():
                     if conn:
                         c = conn.cursor()
                         c.execute('''SELECT id FROM medicines 
-                                     WHERE name = %s AND gtin = %s AND sku = %s AND market = %s 
-                                     AND batch_number = %s AND expiration_date = %s AND owned_by = %s''',
-                                  (name, gtin, sku, market, batch_number, expiration_date, owned_by))
+                                    WHERE name = %s AND gtin = %s AND sku = %s AND market = %s 
+                                    AND batch_number = %s AND expiration_date = %s AND dosage_form = %s 
+                                    AND active_ingredient = %s AND package_size = %s AND owned_by = %s AND atc_code = %s''',
+                                (name, gtin, sku, market, batch_number, expiration_date, dosage_form, active_ingredient, package_size, owned_by, atc_code))
                         if c.fetchone():
                             st.error("Такая запись уже существует")
                             conn.close()
                         else:
                             conn.close()
-                            add_medication(name, gtin, sku, market, batch_number, expiration_date, owned_by, st.session_state['username'])
-                            st.success("Медикамент добавлен!")
+                            add_medication(name, gtin, sku, market, batch_number, expiration_date, dosage_form, active_ingredient, package_size, owned_by, atc_code, st.session_state['username'])
+                            st.success("Препарат добавлен!")
     elif entity == "Компании":
         with st.form(key="add_comp"):
-            gln = st.text_input("GLN", help="Глобальный номер местоположения (до 20 символов)")
-            name_short = st.text_input("Краткое название", help="Краткое название компании (до 50 символов)")
-            name_full = st.text_input("Полное название", help="Полное название компании (до 100 символов)")
-            gcp_compliant = st.checkbox("GCP-совместимость", help="Соответствие стандартам GCP")
-            registration_country = st.text_input("Страна регистрации", help="Страна регистрации (до 50 символов)")
-            address = st.text_input("Адрес", help="Адрес компании (до 200 символов)")
-            type = st.text_input("Тип", help="Тип компании (например, Производитель, до 50 символов)")
+            gln = st.text_input("GLN")
+            name_short = st.text_input("Краткое название")
+            name_full = st.text_input("Полное название")
+            gcp_compliant = st.checkbox("GCP-совместимость")
+            registration_country = st.text_input("Страна регистрации")
+            address = st.text_input("Адрес")
+            type = st.text_input("Тип")
             uploaded_file = st.file_uploader("Импорт из CSV/Excel", type=['csv', 'xlsx'], key="comp_import")
             if uploaded_file:
                 import_data(uploaded_file)
@@ -850,13 +1018,13 @@ def show_add_data():
         companies = get_companies()
         company_options = {f"{row['name_full']} (ID: {row['id']})": row['id'] for _, row in companies.iterrows()} if not companies.empty else {"Нет компаний": None}
         with st.form(key="add_loc"):
-            gln = st.text_input("GLN", help="Глобальный номер местоположения (до 20 символов)")
-            country = st.text_input("Страна", help="Страна локации (до 50 символов)")
-            address = st.text_input("Адрес", help="Адрес локации (до 200 символов)")
-            role = st.text_input("Роль", help="Роль локации (например, Склад, до 50 символов)")
-            name_short = st.text_input("Краткое название", help="Краткое название локации (до 50 символов)")
-            name_full = st.text_input("Полное название", help="Полное название локации (до 100 символов)")
-            owned_by_choice = st.selectbox("Компания-владелец", list(company_options.keys()), help="Выберите компанию-владельца")
+            gln = st.text_input("GLN")
+            country = st.text_input("Страна")
+            address = st.text_input("Адрес")
+            role = st.text_input("Роль")
+            name_short = st.text_input("Краткое название")
+            name_full = st.text_input("Полное название")
+            owned_by_choice = st.selectbox("Компания-владелец", list(company_options.keys()))
             uploaded_file = st.file_uploader("Импорт из CSV/Excel", type=['csv', 'xlsx'], key="loc_import")
             if uploaded_file:
                 import_data(uploaded_file)
@@ -872,14 +1040,14 @@ def show_add_data():
     else:
         medicines = get_medications()
         locations = get_locations()
-        medicine_options = {f"{row['name']} (ID: {row['id']})": row['id'] for _, row in medicines.iterrows()} if not medicines.empty else {"Нет медикаментов": None}
+        medicine_options = {f"{row['name']} (ID: {row['id']})": row['id'] for _, row in medicines.iterrows()} if not medicines.empty else {"Нет препаратов": None}
         location_options = {f"{row['name_short'] or row['name_full'] or f'Локация ID {row['id']}'} (ID: {row['id']})": row['id'] for _, row in locations.iterrows()} if not locations.empty else {"Нет локаций": None}
         with st.form(key="add_op"):
-            medicine_choice = st.selectbox("Медикамент", list(medicine_options.keys()), help="Выберите медикамент")
-            location_choice = st.selectbox("Локация", list(location_options.keys()), help="Выберите локацию")
-            operation_type = st.selectbox("Тип операции", ["Агрегация", "Дистрибьютор", "Поставка", "Списание", "Производство", "Перемещение"], help="Выберите тип операции")
-            operation_date = st.date_input("Дата операции", help="Дата выполнения операции")
-            quantity = st.number_input("Количество", min_value=1, value=1, help="Количество единиц")
+            medicine_choice = st.selectbox("Препарат", list(medicine_options.keys()))
+            location_choice = st.selectbox("Локация", list(location_options.keys()))
+            operation_type = st.selectbox("Тип операции", ["Агрегация", "Дистрибьютор", "Поставка", "Списание", "Производство", "Перемещение"])
+            operation_date = st.date_input("Дата операции")
+            quantity = st.number_input("Количество", min_value=1, value=1)
             uploaded_file = st.file_uploader("Импорт из CSV/Excel", type=['csv', 'xlsx'], key="op_import")
             if uploaded_file:
                 import_data(uploaded_file)
@@ -906,6 +1074,10 @@ def show_filter_data():
             "market": "Рынок",
             "batch_number": "Номер партии",
             "expiration_date": "Срок годности",
+            "dosage_form": "Форма выпуска",
+            "active_ingredient": "Активный ингредиент",
+            "package_size": "Объем/Размер упаковки",
+            "atc_code": "Код АТС",
             "created_date": "Дата создания",
             "owned_by": "ID компании-владельца"
         }
@@ -935,31 +1107,27 @@ def show_filter_data():
     else:
         df = get_operations()
         filter_options = {
-            "medicine_id": "ID медикамента",
+            "medicine_id": "ID Препарата",
             "location_id": "ID локации",
             "operation_type": "Тип операции",
             "operation_date": "Дата операции",
             "quantity": "Количество",
             "created_date": "Дата создания"
         }
-
     if df.empty:
         st.warning(f"Нет данных для фильтрации. Добавьте {entity.lower()} на странице 'Добавить'.")
         return
-
     selected_filters = st.multiselect(
         "Выберите параметры для фильтрации",
         options=list(filter_options.keys()),
         format_func=lambda x: filter_options[x]
     )
-
     if not selected_filters:
         st.info("Выберите хотя бы один параметр для фильтрации.")
         return
-
     filter_values = {}
     for param in selected_filters:
-        if param in ["name", "gtin", "sku", "market", "batch_number", "address", "gln", "country", "role", "name_short", "name_full", "registration_country", "type", "operation_type"]:
+        if param in ["name", "gtin", "sku", "market", "batch_number", "address", "gln", "country", "role", "name_short", "name_full", "registration_country", "type", "operation_type", "dosage_form", "active_ingredient", "package_size"]:
             filter_values[param] = st.text_input(f"Введите {filter_options[param]} (или оставьте пустым)")
         elif param in ["expiration_date", "operation_date", "created_date"]:
             filter_values[param] = st.date_input(f"Выберите {filter_options[param]}")
@@ -971,7 +1139,7 @@ def show_filter_data():
     if st.button("Применить фильтр"):
         filtered_df = df.copy()
         for param in selected_filters:
-            if param in ["name", "gtin", "sku", "market", "batch_number", "address", "gln", "country", "role", "name_short", "name_full", "registration_country", "type", "operation_type"]:
+            if param in ["name", "gtin", "sku", "market", "batch_number", "address", "gln", "country", "role", "name_short", "name_full", "registration_country", "type", "operation_type", "dosage_form", "active_ingredient", "package_size"]:
                 if filter_values[param]:
                     filtered_df = filtered_df[filtered_df[param].str.contains(filter_values[param], case=False, na=False)]
             elif param in ["expiration_date", "operation_date", "created_date"]:
@@ -995,117 +1163,464 @@ def show_visualize():
         if df.empty:
             st.warning("Нет данных для визуализации. Добавьте Препараты на странице 'Добавить'.")
             return
-        viz_type = st.selectbox("Тип визуализации", ["Распределение по рынкам", "Доля медикаментов по сроку годности"])
+        viz_type = st.selectbox("Тип визуализации", [
+            "Распределение по рынкам",
+            "Доля препаратов по сроку годности",
+            "Распределение по формам выпуска",
+            "Препараты по размеру упаковки"
+        ])
         if viz_type == "Распределение по рынкам":
-            plt.figure(figsize=(10, 6))
-            sns.countplot(data=df, x='market')
-            plt.xticks(rotation=45)
-            plt.title("Распределение медикаментов по рынкам")
-            st.pyplot(plt)
+            if 'market' in df.columns:
+                fig = px.histogram(df, x='market', title="Распределение препаратов по рынкам", color='market')
+                fig.update_layout(xaxis_title="Рынок", yaxis_title="Количество", showlegend=True, legend=dict(orientation="v", yanchor="top", y=1, xanchor="right", x=1))
+                st.plotly_chart(fig)
+            else:
+                st.error("Колонка 'market' отсутствует в данных.")
+        elif viz_type == "Доля препаратов по сроку годности":
+            if 'expiration_date' in df.columns:
+                current_date = pd.to_datetime("2025-05-21")
+                df['days_to_expiry'] = (pd.to_datetime(df['expiration_date']) - current_date).dt.days
+                df['expiry_status'] = pd.cut(df['days_to_expiry'],
+                                            bins=[-float('inf'), 0, 180, 365, float('inf')],
+                                            labels=['Просрочено', 'Менее 6 мес.', '6-12 мес.', 'Более года'])
+                fig = px.pie(df, names='expiry_status', title="Доля препаратов по сроку годности")
+                fig.update_layout(legend_title="Статус срока годности", showlegend=True, legend=dict(orientation="v", yanchor="top", y=1, xanchor="right", x=1))
+                st.plotly_chart(fig)
+            else:
+                st.error("Колонка 'expiration_date' отсутствует в данных.")
+        elif viz_type == "Распределение по формам выпуска":
+            if 'dosage_form' in df.columns:
+                fig = px.histogram(df, x='dosage_form', title="Распределение препаратов по формам выпуска", color='dosage_form')
+                fig.update_layout(xaxis_title="Форма выпуска", yaxis_title="Количество", showlegend=True, legend=dict(orientation="v", yanchor="top", y=1, xanchor="right", x=1))
+                st.plotly_chart(fig)
+            else:
+                st.error("Колонка 'dosage_form' отсутствует в данных.")
         else:
-            current_date = pd.to_datetime("2025-05-10")
-            df['days_to_expiry'] = (pd.to_datetime(df['expiration_date']) - current_date).dt.days
-            df['expiry_status'] = pd.cut(df['days_to_expiry'],
-                                        bins=[-float('inf'), 0, 180, 365, float('inf')],
-                                        labels=['Просрочено', 'Менее 6 мес.', '6-12 мес.', 'Более года'])
-            plt.figure(figsize=(8, 8))
-            df['expiry_status'].value_counts().plot.pie(autopct='%1.1f%%')
-            plt.title("Доля медикаментов по сроку годности")
-            plt.ylabel('')
-            st.pyplot(plt)
+            if 'package_size' in df.columns:
+                fig = px.histogram(df, x='package_size', title="Препараты по размеру упаковки", color='package_size')
+                fig.update_layout(xaxis_title="Объем/Размер упаковки", yaxis_title="Количество", showlegend=True, legend=dict(orientation="v", yanchor="top", y=1, xanchor="right", x=1))
+                st.plotly_chart(fig)
+            else:
+                st.error("Колонка 'package_size' отсутствует в данных.")
     elif entity == "Компании":
         df = get_companies()
         if df.empty:
             st.warning("Нет данных для визуализации. Добавьте компании на странице 'Добавить'.")
             return
-        viz_type = st.selectbox("Тип визуализации", ["Распределение по странам регистрации", "Доля по типам компаний"])
+        viz_type = st.selectbox("Тип визуализации", [
+            "Распределение по странам регистрации",
+            "Доля по типам компаний",
+            "Компании по GCP-совместимости"
+        ])
         if viz_type == "Распределение по странам регистрации":
-            plt.figure(figsize=(10, 6))
-            sns.countplot(data=df, x='registration_country')
-            plt.xticks(rotation=45)
-            plt.title("Распределение компаний по странам регистрации")
-            st.pyplot(plt)
+            if 'registration_country' in df.columns:
+                fig = px.histogram(df, x='registration_country', title="Распределение компаний по странам регистрации", color='registration_country')
+                fig.update_layout(xaxis_title="Страна регистрации", yaxis_title="Количество", showlegend=True, legend=dict(orientation="v", yanchor="top", y=1, xanchor="right", x=1))
+                st.plotly_chart(fig)
+            else:
+                st.error("Колонка 'registration_country' отсутствует в данных.")
+        elif viz_type == "Доля по типам компаний":
+            if 'type' in df.columns:
+                fig = px.pie(df, names='type', title="Доля компаний по типам")
+                fig.update_layout(legend_title="Тип компании", showlegend=True, legend=dict(orientation="v", yanchor="top", y=1, xanchor="right", x=1))
+                st.plotly_chart(fig)
+            else:
+                st.error("Колонка 'type' отсутствует в данных.")
         else:
-            plt.figure(figsize=(8, 8))
-            df['type'].value_counts().plot.pie(autopct='%1.1f%%')
-            plt.title("Доля компаний по типам")
-            plt.ylabel('')
-            st.pyplot(plt)
+            if 'gcp_compliant' in df.columns:
+                fig = px.histogram(df, x='gcp_compliant', title="Компании по GCP-совместимости", color='gcp_compliant')
+                fig.update_layout(xaxis_title="GCP-совместимость", yaxis_title="Количество", showlegend=True, legend=dict(orientation="v", yanchor="top", y=1, xanchor="right", x=1))
+                st.plotly_chart(fig)
+            else:
+                st.error("Колонка 'gcp_compliant' отсутствует в данных.")
     elif entity == "Локации":
         df = get_locations()
         if df.empty:
             st.warning("Нет данных для визуализации. Добавьте локации на странице 'Добавить'.")
             return
-        viz_type = st.selectbox("Тип визуализации", ["Распределение по странам", "Расположение на карте"])
+        viz_type = st.selectbox("Тип визуализации", [
+            "Распределение по странам",
+            "Распределение по ролям",
+            "Локации по компаниям"
+        ])
         if viz_type == "Распределение по странам":
-            plt.figure(figsize=(10, 6))
-            sns.countplot(data=df, x='country')
-            plt.xticks(rotation=45)
-            plt.title("Распределение локаций по странам")
-            st.pyplot(plt)
+            if 'country' in df.columns:
+                fig = px.histogram(df, x='country', title="Распределение локаций по странам", color='country')
+                fig.update_layout(xaxis_title="Страна", yaxis_title="Количество", showlegend=True, legend=dict(orientation="v", yanchor="top", y=1, xanchor="right", x=1))
+                st.plotly_chart(fig)
+            else:
+                st.error("Колонка 'country' отсутствует в данных.")
+        elif viz_type == "Распределение по ролям":
+            if 'role' in df.columns:
+                fig = px.histogram(df, x='role', title="Распределение локаций по ролям", color='role')
+                fig.update_layout(xaxis_title="Роль", yaxis_title="Количество", showlegend=True, legend=dict(orientation="v", yanchor="top", y=1, xanchor="right", x=1))
+                st.plotly_chart(fig)
+            else:
+                st.error("Колонка 'role' отсутствует в данных.")
         else:
-            plt.figure(figsize=(10, 6))
-            sns.scatterplot(data=df, x='name_short', y='country', hue='role', size='role')
-            plt.xticks(rotation=45)
-            plt.title("Локации по координатам")
-            st.pyplot(plt)
+            if 'owned_by' in df.columns:
+                fig = px.histogram(df, x='owned_by', title="Локации по компаниям", color='owned_by')
+                fig.update_layout(xaxis_title="ID компании", yaxis_title="Количество", showlegend=True, legend=dict(orientation="v", yanchor="top", y=1, xanchor="right", x=1))
+                st.plotly_chart(fig)
+            else:
+                st.error("Колонка 'owned_by' отсутствует в данных.")
     else:
         df = get_operations()
         if df.empty:
             st.warning("Нет данных для визуализации. Добавьте операции на странице 'Добавить'.")
             return
-        viz_type = st.selectbox("Тип визуализации", ["Количество операций по датам", "Доля по типам операций"])
+        viz_type = st.selectbox("Тип визуализации", [
+            "Количество операций по датам",
+            "Доля по типам операций",
+            "Количество по типам операций",
+            "Операции по Препаратам"
+        ])
         if viz_type == "Количество операций по датам":
-            df['operation_date'] = pd.to_datetime(df['operation_date'])
-            df_grouped = df.groupby(df['operation_date'].dt.date)['quantity'].sum().reset_index()
-            plt.figure(figsize=(10, 6))
-            sns.lineplot(data=df_grouped, x='operation_date', y='quantity')
-            plt.xticks(rotation=45)
-            plt.title("Количество операций по датам")
-            st.pyplot(plt)
+            if 'operation_date' in df.columns and 'quantity' in df.columns:
+                df['operation_date'] = pd.to_datetime(df['operation_date'])
+                df_grouped = df.groupby(df['operation_date'].dt.date)['quantity'].sum().reset_index()
+                fig = px.line(df_grouped, x='operation_date', y='quantity', title="Количество операций по датам")
+                fig.update_layout(xaxis_title="Дата операции", yaxis_title="Количество", showlegend=True, legend=dict(orientation="v", yanchor="top", y=1, xanchor="right", x=1))
+                st.plotly_chart(fig)
+            else:
+                st.error("Колонки 'operation_date' или 'quantity' отсутствуют в данных.")
+        elif viz_type == "Доля по типам операций":
+            if 'operation_type' in df.columns:
+                fig = px.pie(df, names='operation_type', title="Доля операций по типам")
+                fig.update_layout(legend_title="Тип операции", showlegend=True, legend=dict(orientation="v", yanchor="top", y=1, xanchor="right", x=1))
+                st.plotly_chart(fig)
+            else:
+                st.error("Колонка 'operation_type' отсутствует в данных.")
+        elif viz_type == "Количество по типам операций":
+            if 'operation_type' in df.columns:
+                fig = px.histogram(df, x='operation_type', title="Количество по типам операций", color='operation_type')
+                fig.update_layout(xaxis_title="Тип операции", yaxis_title="Количество", showlegend=True, legend=dict(orientation="v", yanchor="top", y=1, xanchor="right", x=1))
+                st.plotly_chart(fig)
+            else:
+                st.error("Колонка 'operation_type' отсутствует в данных.")
         else:
-            plt.figure(figsize=(8, 8))
-            df['operation_type'].value_counts().plot.pie(autopct='%1.1f%%')
-            plt.title("Доля операций по типам")
-            plt.ylabel('')
-            st.pyplot(plt)
+            if 'medicine_id' in df.columns:
+                # Объединяем с таблицей medicines, чтобы получить названия препаратов
+                medicines = get_medications()
+                df = df.merge(medicines[['id', 'name']], left_on='medicine_id', right_on='id', how='left')
+                df['medicine_name'] = df['name'].fillna('Не указан')
+                fig = px.histogram(df, x='medicine_name', title="Операции по Препаратам", color='medicine_name')
+                fig.update_layout(xaxis_title="Название препарата", yaxis_title="Количество", showlegend=True, legend=dict(orientation="v", yanchor="top", y=1, xanchor="right", x=1))
+                st.plotly_chart(fig)
+            else:
+                st.error("Колонка 'medicine_id' отсутствует в данных.")
 
+def show_reports():
+    if st.session_state['role'] not in ['admin', 'analyst']:
+        st.error("Доступ запрещен")
+        return
+    st.subheader("Создание отчетов")
+
+    medicines = get_medications()
+    companies = get_companies()
+    locations = get_locations()
+    operations = get_operations()
+
+    medicine_options = {f"{row['name']} (ID: {row['id']})": row['id'] for _, row in medicines.iterrows()} if not medicines.empty else {"Нет препаратов": None}
+    with st.form(key="report_form"):
+        report_title = st.text_input("Название отчета", placeholder="Введите название отчета")
+        medicine_choice = st.selectbox("Препарат", list(medicine_options.keys()), help="Выберите препарат для отчета")
+        submit_button = st.form_submit_button("Сформировать отчет")
+
+    if submit_button:
+        if not report_title:
+            st.error("Название отчета обязательно")
+            return
+        if not medicine_choice or not medicine_options[medicine_choice]:
+            st.error("Выберите препарат")
+            return
+
+        # Фильтрация данных
+        med_id = medicine_options[medicine_choice]
+        filtered_meds = medicines[medicines['id'] == med_id]
+        filtered_ops = operations[operations['medicine_id'] == med_id]
+        company_id = filtered_meds['owned_by'].iloc[0] if not filtered_meds.empty else None
+        filtered_companies = companies[companies['id'] == company_id] if company_id else pd.DataFrame()
+        location_ids = filtered_ops['location_id'].unique() if not filtered_ops.empty else []
+        filtered_locations = locations[locations['id'].isin(location_ids)] if location_ids else pd.DataFrame()
+
+        # Создание отчета
+        doc = Document()
+        # Настройка стилей для компактности
+        styles = doc.styles
+        compact_style = styles.add_style('Compact', WD_STYLE_TYPE.PARAGRAPH)
+        compact_style.font.size = Pt(9)  # Меньший шрифт
+        compact_style.paragraph_format.space_after = Pt(2)  # Минимальный отступ после абзаца
+        compact_style.paragraph_format.line_spacing = 1.0  # Одинарный межстрочный интервал
+
+        doc.add_heading("KVINTA (отчеты)", 0)
+        doc.add_heading(f"Отчет: {report_title}", 1)
+
+        # Препарат
+        doc.add_heading("Препарат", level=2)
+        if not filtered_meds.empty:
+            row = filtered_meds.iloc[0]
+            fields = [
+                ("Название", str(row.get('name', 'Не указано'))),
+                ("GTIN", str(row.get('gtin', 'Не указано'))),
+                ("SKU", str(row.get('sku', 'Не указано'))),
+                ("Рынок", str(row.get('market', 'Не указано'))),
+                ("Партия", str(row.get('batch_number', 'Не указано'))),
+                ("Срок годности", str(row.get('expiration_date', 'Не указано'))),
+                ("Форма", str(row.get('dosage_form', 'Не указано'))),
+                ("Ингредиент", str(row.get('active_ingredient', 'Не указано'))),
+                ("Упаковка", str(row.get('package_size', 'Не указано'))),
+                ("Код АТС", str(row.get('atc_code', 'Не указано')))
+            ]
+            table = doc.add_table(rows=len(fields) + 1, cols=2)
+            table.style = 'Table Grid'
+            table.autofit = True
+            for col in table.columns:
+                for cell in col.cells:
+                    cell.paragraphs[0].style = compact_style
+            # Заголовки
+            headers = ["Параметр", "Значение"]
+            table.rows[0].cells[0].text = headers[0]
+            table.rows[0].cells[1].text = headers[1]
+            # Данные
+            for i, (header, value) in enumerate(fields, 1):
+                cells = table.rows[i].cells
+                cells[0].text = header
+                cells[1].text = value
+        else:
+            p = doc.add_paragraph("Данные о препарате не найдены", style='Compact')
+
+        # Компания
+        doc.add_heading("Компания", level=2)
+        if not filtered_companies.empty:
+            row = filtered_companies.iloc[0]
+            fields = [
+                ("GLN", str(row.get('gln', 'Не указано'))),
+                ("Краткое название", str(row.get('name_short', 'Не указано'))),
+                ("Полное название", str(row.get('name_full', 'Не указано'))),
+                ("GCP", "Да" if row.get('gcp_compliant', False) else "Нет"),
+                ("Страна", str(row.get('registration_country', 'Не указано'))),
+                ("Адрес", str(row.get('address', 'Не указано'))),
+                ("Тип", str(row.get('type', 'Не указано')))
+            ]
+            table = doc.add_table(rows=len(fields) + 1, cols=2)
+            table.style = 'Table Grid'
+            table.autofit = True
+            for col in table.columns:
+                for cell in col.cells:
+                    cell.paragraphs[0].style = compact_style
+            headers = ["Параметр", "Значение"]
+            table.rows[0].cells[0].text = headers[0]
+            table.rows[0].cells[1].text = headers[1]
+            for i, (header, value) in enumerate(fields, 1):
+                cells = table.rows[i].cells
+                cells[0].text = header
+                cells[1].text = value
+        else:
+            p = doc.add_paragraph("Компания не найдена", style='Compact')
+
+        # Местоположение
+        doc.add_heading("Местоположение", level=2)
+        if not filtered_locations.empty:
+            table = doc.add_table(rows=len(filtered_locations) + 1, cols=6)
+            table.style = 'Table Grid'
+            table.autofit = True
+            for col in table.columns:
+                for cell in col.cells:
+                    cell.paragraphs[0].style = compact_style
+            headers = ["GLN", "Страна", "Адрес", "Роль", "Краткое название", "Полное название"]
+            for i, header in enumerate(headers):
+                table.rows[0].cells[i].text = header
+            for idx, row in enumerate(filtered_locations.itertuples(), 1):
+                cells = table.rows[idx].cells
+                cells[0].text = str(row.gln)
+                cells[1].text = str(row.country)
+                cells[2].text = str(row.address)
+                cells[3].text = str(row.role)
+                cells[4].text = str(row.name_short)
+                cells[5].text = str(row.name_full)
+        else:
+            p = doc.add_paragraph("Локации не найдены", style='Compact')
+
+        # Операции
+        doc.add_heading("Операции", level=2)
+        if not filtered_ops.empty:
+            table = doc.add_table(rows=len(filtered_ops) + 1, cols=5)
+            table.style = 'Table Grid'
+            table.autofit = True
+            for col in table.columns:
+                for cell in col.cells:
+                    cell.paragraphs[0].style = compact_style
+            headers = ["Препарат", "Локация", "Тип операции", "Дата", "Кол-во"]
+            for i, header in enumerate(headers):
+                table.rows[0].cells[i].text = header
+            for idx, row in enumerate(filtered_ops.itertuples(), 1):
+                med_name = medicines[medicines['id'] == row.medicine_id]['name'].iloc[0] if row.medicine_id in medicines['id'].values else 'Не указан'
+                loc_name = locations[locations['id'] == row.location_id]['name_short'].iloc[0] if row.location_id in locations['id'].values else 'Не указана'
+                cells = table.rows[idx].cells
+                cells[0].text = med_name
+                cells[1].text = loc_name
+                cells[2].text = str(row.operation_type)
+                cells[3].text = str(row.operation_date)
+                cells[4].text = str(row.quantity)
+        else:
+            p = doc.add_paragraph("Операции не найдены", style='Compact')
+        # Сохранение в Word
+        word_buffer = io.BytesIO()
+        doc.save(word_buffer)
+        word_buffer.seek(0)
+
+        st.download_button(
+            label="Скачать отчет (Word)",
+            data=word_buffer,
+            file_name=f"{report_title}.docx",
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        )
+        log_action("Generated report", f"Title: {report_title}", st.session_state['username'])
+       
 def show_logs():
     st.subheader("Просмотр логов (Админ)")
     if st.session_state['role'] != 'admin':
+        log_action("Access denied to view logs", username=st.session_state['username'])
         st.error("Доступ запрещен")
         return
-    logs = get_logs()
+    st.write("### Основные логи")
+    logs = get_logs('main')
     st.text_area("Логи", value="".join(logs), height=400)
     st.download_button(
-        label="Скачать лог-файл",
+        label="Скачать основные логи",
         data="".join(logs),
         file_name="pharma_metadata.log",
         mime="text/plain"
     )
+    # st.write("### Логи отказов в доступе к редактированию")
+    # edit_logs = get_logs('edit')
+    # st.text_area("Логи отказов", value="".join(edit_logs), height=200)
+    # st.download_button(
+        #label="Скачать логи отказов",
+        #data="".join(edit_logs),
+        #file_name="edit_access_denied.log",
+        #mime="text/plain"
+    #)
 
+def show_kvinta_page():
+    st.markdown("""
+    <style>
+        .kvinta-container {
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            padding: 30px;
+            border-radius: 10px;
+            text-align: center;
+            background-color: #f0f2f6;
+            max-width: 800px;
+            margin: 50px auto;
+            box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1);
+        }
+        .kvinta-container h1 {
+            color: #2c3e50;
+            font-size: 36px;
+            margin-bottom: 20px;
+            font-weight: bold;
+        }
+        .kvinta-container p {
+            font-size: 18px;
+            color: #555;
+            margin-bottom: 20px;
+            line-height: 1.6;
+        }
+        .button-container {
+            display: flex;
+            gap: 15px;
+            flex-wrap: wrap;
+            justify-content: center;
+        }
+        .stButton > button {
+            background-color: #4CAF50;
+            color: white;
+            padding: 12px 24px;
+            font-size: 18px;
+            border-radius: 5px;
+            border: none;
+            cursor: pointer;
+            transition: background-color 0.3s;
+        }
+        .stButton > button:hover {
+            background-color: #45a049;
+        }
+        .secondary-button > button {
+            background-color: #6c757d;
+            color: white;
+            padding: 10px 20px;
+            font-size: 16px;
+            border-radius: 5px;
+            border: none;
+            cursor: pointer;
+        }
+        .secondary-button > button:hover {
+            background-color: #5a6268;
+        }
+    </style>
+    """, unsafe_allow_html=True)
+
+    st.markdown('<div class="kvinta-container">', unsafe_allow_html=True)
+    st.markdown('<h1>Kvinta</h1>', unsafe_allow_html=True)
+    st.markdown("""
+    <p>Добро пожаловать в платформу Kvinta — ваш надежный партнер в управлении данными фармацевтической отрасли. 
+    Наша система предоставляет передовые решения для управления метаданными, аналитики и логистики лекарственных препаратов. 
+    Перейдите в подсистему управления метаданными для работы с данными или ознакомьтесь с дополнительными возможностями Kvinta.</p>
+    """, unsafe_allow_html=True)
+    
+    st.markdown('<div class="button-container">', unsafe_allow_html=True)
+    if st.button("Перейти к подсистеме управления метаданными", key="main_system_button"):
+        st.session_state['show_kvinta_page'] = False
+        st.session_state['show_main_page'] = True
+        st.rerun()
+    
+    # Placeholder buttons for a more interactive feel (non-functional)
+    st.markdown('<div class="secondary-button">', unsafe_allow_html=True)
+    st.button("О платформе Kvinta", key="about_button")
+    st.markdown('</div>', unsafe_allow_html=True)
+    
+    st.markdown('<div class="secondary-button">', unsafe_allow_html=True)
+    st.button("Наши услуги", key="services_button")
+    st.markdown('</div>', unsafe_allow_html=True)
+       
+    st.markdown('<div class="secondary-button">', unsafe_allow_html=True)
+    st.button("Связаться с нами", key="contact_button")
+    st.markdown('</div>', unsafe_allow_html=True)
+    
+    st.markdown('</div>', unsafe_allow_html=True)
+    st.markdown('</div>', unsafe_allow_html=True)
+    
 def show_home():
+    st.title("Pharma Metadata System")
     st.subheader("Главная страница")
     st.write("""
     ### Добро пожаловать в Pharma Metadata System
     - **Версия**: 0.01
     - **Разработчик**: Kvinta
-    - **Описание**: Система предназначена для управления данными о фармацевтических компаниях, медикаментах, локациях и операциях.
+    - **Описание**: Подсистема предназначена для работы с метаданными лекарственных препаратов.
     - **Функции**:
       - Просмотр и добавление записей.
       - Редактирование и удаление данных (для администраторов и аналитиков).
       - Фильтрация и визуализация данных.
-      - Импорт и экспорт данных в форматах CSV/Excel.
+      - Импорт и экспорт данных в форматах CSV.
+      - Создание отчетов (для администраторов и аналитиков).
       - Логирование действий пользователей (для администраторов).
-    - **Подсказки**:
-      - GLN: 13-значный уникальный код (например, 1234567890123).
-      - Роли локаций: Склад, Производство, Дистрибьютор.
-      - Типы компаний: Производитель, Дистрибьютор, CMO, 3PL.
     """)
+    if st.button("Выйти"):
+        log_action("User exited subsystem", st.session_state['username'])
+        st.session_state['show_kvinta_page'] = True
+        st.session_state['show_main_page'] = False
+        st.session_state['show_access_denied'] = False
+        st.rerun()
 
 def main():
-    st.title("Pharma Metadata System")
     init_db()
+    clear_logs_daily()
 
     st.markdown("""
     <style>
@@ -1144,48 +1659,51 @@ def main():
         st.session_state['logged_in'] = False
         st.session_state['role'] = None
         st.session_state['username'] = None
+        st.session_state['show_access_denied'] = False
+        st.session_state['show_kvinta_page'] = False
+        st.session_state['show_main_page'] = False
 
-    if not st.session_state['logged_in']:
+    st.subheader("Pharma Metadata System")
+    if st.session_state['show_access_denied']:
+        show_access_denied()
+    elif not st.session_state['logged_in']:
         auth_interface()
-    else:
-        if st.session_state['role'] == 'admin':
-            menu = ["Главная страница", "Просмотр", "Добавить", "Редактировать", "Фильтр", "Визуализация", "Логи"]
-        elif st.session_state['role'] == 'analyst':
-            menu = ["Главная страница", "Просмотр", "Добавить", "Редактировать", "Фильтр", "Визуализация"]
+    elif st.session_state['show_kvinta_page']:
+        show_kvinta_page()
+    elif st.session_state['show_main_page']:
+        if st.session_state['role'] in ['admin', 'operator', 'analyst']:
+            if st.session_state['role'] == 'admin':
+                menu = ["Главная страница", "Просмотр", "Добавить", "Редактировать", "Фильтрация", "Визуализация", "Отчеты", "Логи"]
+            elif st.session_state['role'] == 'analyst':
+                menu = ["Главная страница", "Просмотр", "Добавить", "Редактировать", "Фильтрация", "Визуализация", "Отчеты"]
+            else:  # operator
+                menu = ["Главная страница", "Просмотр", "Добавить"]
+
+            st.sidebar.title(f"Добро пожаловать, {st.session_state['role']}")
+            choice = st.sidebar.selectbox("Меню", menu, index=0)
+
+            if choice == "Главная страница":
+                show_home()
+            elif choice == "Просмотр":
+                show_view_data()
+            elif choice == "Добавить":
+                show_add_data()
+            elif choice == "Редактировать":
+                show_edit_delete_data()
+            elif choice == "Фильтрация":
+                show_filter_data()
+            elif choice == "Визуализация":
+                show_visualize()
+            elif choice == "Отчеты":
+                show_reports()
+            elif choice == "Логи":
+                show_logs()
         else:
-            menu = ["Главная страница", "Просмотр", "Добавить"]
-
-        st.sidebar.title(f"Добро пожаловать, {st.session_state['username']}")
-        choice = st.sidebar.selectbox("Меню", menu, index=0)
-
-        if choice == "Главная страница":
-            show_home()
-        elif choice == "Просмотр":
-            show_view_data()
-        elif choice == "Добавить":
-            show_add_data()
-        elif choice == "Редактировать":
-            show_edit_delete_data()
-        elif choice == "Фильтр":
-            show_filter_data()
-        elif choice == "Визуализация":
-            show_visualize()
-        elif choice == "Логи":
-            show_logs()
-
-        if st.sidebar.button("Выйти"):
-            st.session_state['logged_in'] = False
-            st.session_state['role'] = None
-            log_action("User logged out", st.session_state['username'])
-            st.session_state['username'] = None
-            st.rerun()
-
-    st.markdown(
-        """
-        <div class="footer">Принадлежит компании Kvinta, версия подсистемы 0.01</div>
-        """,
-        unsafe_allow_html=True
-    )
-
+            show_access_denied()
+    else:
+        # Default to Kvinta page after login if no other page is active
+        show_kvinta_page()
+            
+            
 if __name__ == "__main__":
     main()
