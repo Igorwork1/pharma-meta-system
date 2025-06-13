@@ -1,6 +1,6 @@
 import streamlit as st
 import pandas as pd
-import psycopg2
+import psycopg
 import logging
 from datetime import datetime
 import plotly.express as px
@@ -62,17 +62,19 @@ def clear_logs_daily():
 # Настройка подключения к PostgreSQL
 def get_db_connection():
     try:
-        conn = psycopg2.connect(
+        conn = psycopg.connect(
             dbname="meta_base",
             user="postgres",
             password="1234",
             host="localhost",
-            port="5432"
+            port="5432",
+            sslmode="require"  # Для облачной базы, если требуется
         )
         return conn
-    except psycopg2.Error as e:
+    except psycopg.Error as e:
         st.error(f"Ошибка подключения к базе данных: {e}")
         return None
+        
 def init_db():
     conn = get_db_connection()
     if conn is None:
